@@ -7,6 +7,7 @@ from typing import Any, List, Tuple, Union
 
 import ray
 import torch
+import torch.nn.functional as F
 
 from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean
 from openrlhf.trainer.ray.launcher import RayActorGroup
@@ -210,6 +211,15 @@ def update_samples_with_rewards(rewards_info, samples_list):
         scores_list = torch.cat([info["scores"] for info in rewards_info], dim=0).chunk(len(samples_list))
     else:
         scores_list = rewards_list
+    
+    # ------------------------- for distillation -------------------------
+    if "distillation_kl" in rewards_info[0]:
+        distillation_kl_list = [info["distillation_kl"] for info in rewards_info]
+    if "teacher_tokens" in rewards_info[0]:
+        teacher_tokens_list = torch.cat([info["teacher_tokens"] for info in rewards_info], dim=0).chunk(len(samples_list))
+        teacher_probs_list = torch.cat([info["teacher_probs"] for info in rewards_info], dim=0).chunk(len(samples_list))
+        
+    # ------------------------- for distillation -------------------------
 
     # Process extra_logs if present
     if "extra_logs" in rewards_info[0]:
@@ -227,6 +237,13 @@ def update_samples_with_rewards(rewards_info, samples_list):
         samples.scores = scores_list[i]
         samples.info["score"] = scores_list[i]
         samples.info["reward"] = rewards_list[i]
+        # ------------------------- for distillation -------------------------
+        if "distillation_kl" in rewards_info[0]:
+            samples.distillation_kl = distillation_kl_list[i]
+        if "teacher_tokens" in rewards_info[0]:
+            samples.teacher_tokens = teacher_tokens_list[i]
+            samples.teacher_probs = teacher_probs_list[i]
+        # ------------------------- for distillation -------------------------
         if "extra_logs" in rewards_info[0]:
             for key, values in merged_logs.items():
                 samples.info[key] = values[i]
@@ -567,6 +584,37 @@ class RemoteExperienceMaker(ABC):
         elif self.remote_rm_url:
             # Get rewards info from remote model
             rewards_info = ray.get(r_refs)
+            # ------------------------- for distillation -------------------------
+            if "teacher_log_probs" in rewards_info[0]:
+                distillation_kl_list = []
+                for (
+                    sample_info, 
+                    action_log_probs, 
+                    action_mask
+                ) in zip(
+                    rewards_info, 
+                    action_log_probs_list, 
+                    action_mask_list
+                ):
+                    teacher_log_probs = sample_info.pop("teacher_log_probs")
+                    valid_len = action_mask.sum(dim=1)
+                    teacher_log_probs = [
+                        F.pad(
+                            log_probs[-valid_len[i]:], 
+                            (0, action_mask.shape[1] - log_probs[-valid_len[i]:].size(0))
+                        )
+                        for i, log_probs in enumerate(teacher_log_probs)
+                    ]
+                    teacher_log_probs = torch.stack(teacher_log_probs, dim=0)
+                    distillation_kl = compute_approx_kl(
+                        action_log_probs * action_mask.float(),
+                        teacher_log_probs * action_mask.float(),
+                        kl_estimator="k1",
+                    )
+                    distillation_kl = distillation_kl.detach() * action_mask.float()
+                    distillation_kl_list.append(distillation_kl)
+                    sample_info["distillation_kl"] = distillation_kl
+            # ------------------------- for distillation -------------------------
             # Process rewards and scores
             update_samples_with_rewards(rewards_info, samples_list)
         else:
@@ -623,45 +671,78 @@ class RemoteExperienceMaker(ABC):
         """
         args = self.strategy.args
 
-        # get rewards from experiences
-        rewards = [experience.rewards for experience in experiences]
-        rewards = torch.cat(rewards).reshape(-1, args.n_samples_per_prompt)
+        rewards = []
+        for i, experience in enumerate(experiences):
+            if hasattr(experience, "distillation_kl"):
+                distillation_kl = experience.distillation_kl
+                if not self.args.enable_fasle_distillation:
+                    distillation_kl = distillation_kl * experience.rewards.unsqueeze(-1)
+                reward = compute_reward(
+                    experience.rewards,
+                    self.args.distillation_kl_coef,
+                    distillation_kl,
+                    action_mask=experience.action_mask,
+                    reward_clip_range=args.reward_clip_range,
+                )
+            else:
+                reward = compute_reward(
+                    experience.rewards,
+                    self.kl_ctl.value,
+                    experience.kl,
+                    action_mask=experience.action_mask,
+                    reward_clip_range=args.reward_clip_range,
+                )
+            rewards.append(reward)
+
+        max_reward_len = max([reward.shape[1] for reward in rewards])
+        for i in range(len(rewards)):
+            if rewards[i].shape[1] < max_reward_len:
+                rewards[i] = F.pad(rewards[i], (0, max_reward_len - rewards[i].shape[1]))
+        rewards = torch.cat(rewards)
+        rewards = rewards.reshape(-1, args.n_samples_per_prompt, rewards.size(1))
 
         # log group reward std
         if args.n_samples_per_prompt > 1:
-            group_reward_stds = (
-                rewards.std(-1, keepdim=True).repeat(1, args.n_samples_per_prompt).reshape(-1).chunk(len(experiences))
-            )
+            # Ensure rewards is in float format for std calculation
+            if hasattr(experience, "distillation_kl"):
+                rewards_std = rewards.float().std(1).mean(-1, keepdim=True).repeat(1, args.n_samples_per_prompt).view(-1)
+            else:
+                rewards_std = rewards.float().sum(-1).std(-1).repeat(1, args.n_samples_per_prompt).view(-1)
+            group_reward_stds = rewards_std.chunk(len(experiences))
+
             for experience, group_reward_std in zip(experiences, group_reward_stds):
                 experience.info["group_reward_std"] = group_reward_std
 
         # reward shaping
         if args.advantage_estimator == "rloo":
-            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)
+            reward_sum = rewards.float().flatten(1).sum(1).view(-1, 1, 1)
+            baseline = (reward_sum - rewards.float()) / (args.n_samples_per_prompt - 1)
             rewards = rewards - baseline
         elif args.advantage_estimator in ["reinforce_baseline", "dr_grpo"]:
             # REINFORCE++-baseline and Dr. GRPO removed the `/std` in GRPO as `/ std` is not needed in RL variance reduction theory.
             # And `k3 KL` has a larger variance than `k1 KL` under a categorical distribution.
-            rewards = rewards - rewards.mean(-1, keepdim=True)
+            reward_sum = rewards.float().flatten(1).sum(1).view(-1, 1, 1)
+            rewards = rewards - reward_sum
         elif args.advantage_estimator == "group_norm":
-            rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            if hasattr(experience, "distillation_kl"):
+                # Ensure rewards is in float format for std calculation
+                reward_mean = rewards.float().flatten(1).mean(1).view(-1, 1, 1)
+                reward_std = rewards.float().flatten(1).std(1).view(-1, 1, 1)
+                rewards = (rewards.float() - reward_mean) / (reward_std + 1e-9)
+            else:
+                # Ensure rewards is in float format for std calculation
+                reward_mean = rewards.float().sum(-1).mean(-1).view(-1, 1, 1)
+                reward_std = rewards.float().sum(-1).std(-1).view(-1, 1, 1)
+                rewards = (rewards.float() - reward_mean) / (reward_std + 1e-9)
 
-        rewards = rewards.reshape(-1).chunk(len(experiences))
+        rewards = rewards.reshape(-1, rewards.size(-1)).chunk(len(experiences))
 
         # calculate return and advantages
         for experience, reward in zip(experiences, rewards):
-            reward = compute_reward(
-                reward,
-                self.kl_ctl.value,
-                experience.kl,
-                action_mask=experience.action_mask,
-                reward_clip_range=args.reward_clip_range,
-            )
-
             if self.advantage_estimator == "gae":
                 experience.advantages, experience.returns = self.get_advantages_and_returns(
                     experience.values,
-                    reward,
+                    reward[:, :experience.action_mask.shape[1]],
                     experience.action_mask,
                     args.gamma,
                     args.lambd,
@@ -677,7 +758,7 @@ class RemoteExperienceMaker(ABC):
                     args.gamma = 1.0
 
                 experience.returns = self.get_cumulative_returns(
-                    reward,
+                    reward[:, :experience.action_mask.shape[1]],
                     experience.action_mask,
                     args.gamma,
                 )

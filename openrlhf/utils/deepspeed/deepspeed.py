@@ -3,7 +3,7 @@ import shutil
 from abc import ABC
 from collections import defaultdict
 from datetime import timedelta
-from typing import List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import deepspeed
 import torch
@@ -47,7 +47,7 @@ class DeepspeedStrategy(ABC):
         train_batch_size=1,
         zero_stage=2,
         bf16=True,
-        args=None,
+        args: Optional[Any] = None,
     ) -> None:
         super().__init__()
 

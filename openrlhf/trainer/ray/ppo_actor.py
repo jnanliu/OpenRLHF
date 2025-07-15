@@ -10,6 +10,7 @@ import torch
 import torch.distributed
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
@@ -240,6 +241,16 @@ class ActorPPOTrainer(ABC):
             experience.info["kl"] = kl_loss.detach()
         else:
             kl_loss = 0
+
+        if self.args.use_distill_loss:
+            target_logits = torch.zeros(
+                len(experience.teacher_tokens), 
+                output.logits.shape[-1], 
+                device=output.logits.device
+            )
+            target_logits.scatter_(1, experience.teacher_tokens, experience.teacher_probs)
+            distill_loss = F.kl_div(F.log_softmax(output.logits[:, :-1], dim=-1), ttarget_logits)
+            actor_loss = actor_loss + distill_loss * self.args.distill_loss_coef
 
         loss = actor_loss + kl_loss * kl_ctl
         # mixtral

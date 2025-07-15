@@ -164,7 +164,7 @@ def train(args):
     # init reference/reward/actor model
     refs = []
     if ref_model is not None:
-        refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
+        refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.ref_pretrain))
     refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain, max_steps, vllm_engines))
     if not args.remote_rm_url:
         refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
@@ -362,6 +362,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--adam_betas", type=float, nargs=2, default=(0.9, 0.95), help="Betas for Adam optimizer")
     parser.add_argument("--reward_clip_range", type=float, nargs=2, default=(-10, 10), help="Reward clip range")
+    parser.add_argument("--distillation_kl_coef", type=float, default=0., help="Distillation KL coef")
+    parser.add_argument("--enable_fasle_distillation", action="store_true", default=False, help="Enable fasle distillation")
 
     # Reinforce/GRPO, etc
     parser.add_argument(
@@ -372,6 +374,8 @@ if __name__ == "__main__":
         help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm, dr_grpo",
     )
     parser.add_argument("--use_kl_loss", action="store_true", default=False, help="whether to use KL loss from GRPO")
+    parser.add_argument("--use_distill_loss", action="store_true", default=False, help="whether to use Distillation loss from GRPO")
+    parser.add_argument("--distill_loss_coef", type=float, default=0.0, help="Distillation loss coef")
     parser.add_argument(
         "--no_advantage_std_norm",
         action="store_true",
@@ -392,9 +396,11 @@ if __name__ == "__main__":
 
     #  Models
     parser.add_argument("--pretrain", type=str, default=None, help="HF model name or path")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="HF tokenizer name or path")
     parser.add_argument("--reward_pretrain", type=str, default=None, help="HF model name or path")
     parser.add_argument("--remote_rm_url", type=str, default=None, help="remote RM API (HTTP)")
     parser.add_argument("--critic_pretrain", type=str, default=None, help="HF model name or path")
+    parser.add_argument("--ref_pretrain", type=str, default=None, help="HF model name or path")
     parser.add_argument("--value_head_prefix", type=str, default="score")
     parser.add_argument("--ref_reward_offload", action="store_true", default=False)
     parser.add_argument("--agent_func_path", type=str, default=None, help="Agent script path")

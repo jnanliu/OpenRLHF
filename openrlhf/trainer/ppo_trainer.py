@@ -1,7 +1,9 @@
+# type: ignore
 import os
 import time
 from abc import ABC
 from datetime import timedelta
+from typing import Any, Dict, List, Optional
 
 import ray
 import torch
@@ -40,7 +42,15 @@ class BasePPOTrainer(ABC):
         self.strategy = strategy
         self.args = strategy.args
 
-        self.tokenizer = get_tokenizer(pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
+        # Type checking for args
+        if self.args is None:
+            raise ValueError("strategy.args cannot be None")
+
+        # self.tokenizer = get_tokenizer(pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
+        if self.args.tokenizer_path is None:
+            self.tokenizer = get_tokenizer(pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
+        else:
+            self.tokenizer = get_tokenizer(self.args.tokenizer_path, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
         self.actor_model_group = actor_model_group
         self.critic_model_group = critic_model_group
         self.reward_model_group = reward_model_group
@@ -83,6 +93,13 @@ class BasePPOTrainer(ABC):
         self._wandb = None
         self._tensorboard = None
         self.generated_samples_table = None
+        
+        # Type checking for args
+        if self.args is None:
+            raise ValueError("self.args cannot be None")
+        if self.strategy.args is None:
+            raise ValueError("self.strategy.args cannot be None")
+            
         if self.strategy.args.use_wandb:
             import wandb
 
@@ -98,15 +115,15 @@ class BasePPOTrainer(ABC):
                 reinit=True,
             )
 
-            wandb.define_metric("train/global_step")
-            wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
-            wandb.define_metric("eval/epoch")
-            wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+            # wandb.define_metric("train/global_step")
+            # wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
+            # wandb.define_metric("eval/global_step")
+            # wandb.define_metric("eval/*", step_metric="eval/global_step", step_sync=True)
             self.generated_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None:
-            from torch.utils.tensorboard import SummaryWriter
+            from torch.utils.tensorboard.writer import SummaryWriter
 
             os.makedirs(self.strategy.args.use_tensorboard, exist_ok=True)
             log_dir = os.path.join(self.strategy.args.use_tensorboard, self.strategy.args.wandb_run_name)

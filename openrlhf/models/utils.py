@@ -50,9 +50,6 @@ def compute_reward(
     if kl_coef <= 0.0:
         kl_coef = 0.0
 
-    if reward_clip_range:
-        r = r.clamp(min=reward_clip_range[0], max=reward_clip_range[1])
-
     kl_reward = -kl_coef * kl
     # The following code is equivalent to:
     #
@@ -67,6 +64,9 @@ def compute_reward(
     last_reward = torch.zeros_like(kl).scatter_(dim=1, index=eos_indices, src=r.unsqueeze(1).to(kl.dtype))
 
     reward = last_reward + kl_reward
+
+    if reward_clip_range:
+        reward = reward.clamp(min=reward_clip_range[0], max=reward_clip_range[1])
 
     return reward
 
