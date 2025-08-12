@@ -180,7 +180,7 @@ class Actor(nn.Module):
 
         if self.packing_samples:
             log_probs = gather_and_pad_tensor(log_probs, ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
-            output["logits"] = gather_and_pad_tensor(output["logits"], ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
+            # output["logits"] = gather_and_pad_tensor(output["logits"], ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
 
         log_probs = log_probs[:, :-1]
         if not return_action_log_probs and return_logprobs:
